@@ -235,6 +235,8 @@ class AutoBotEgo(BaseModel):
         self.prob_predictor = init_(nn.Linear(self.d_k, 1))
 
         self.criterion = Criterion(self.config)
+        self.criterion_fde = Criterion_fde(self.config)
+
 
         self.fisher_information = None
         self.optimal_params = None
@@ -377,26 +379,31 @@ class AutoBotEgo(BaseModel):
 
     def get_loss(self, batch, prediction):
         inputs = batch['input_dict']
-        ground_truth = torch.cat([inputs['center_gt_trajs'][..., :2], inputs['center_gt_trajs_mask'].unsqueeze(-1)],
+        
+        ground_truth = torch.cat([inputs['obj_trajs_future_state'][..., :2], inputs['obj_trajs_future_mask'].unsqueeze(-1)],
                                  dim=-1)
-        loss = self.criterion(prediction, ground_truth, inputs['center_gt_final_valid_idx'])
+        
+        ground_truth_og = torch.cat([inputs['center_gt_trajs'][..., :2], inputs['center_gt_trajs_mask'].unsqueeze(-1)],
+                                 dim=-1)        
+
+        loss = self.criterion(prediction, ground_truth_og, )
         return loss
 
     def configure_optimizers(self):
-        optimizer = optim.Adam(self.parameters(), lr=self.config['learning_rate'], eps=0.0001)
+        optimizer = optim.Adam(self.parameters(), lr=self.config['learning_rate'], eps=0.0001, capturable = False)
         scheduler = MultiStepLR(optimizer, milestones=self.config['learning_rate_sched'], gamma=0.5,
                                 verbose=True)
         return [optimizer], [scheduler]
 
-#MJTODO: modiify this function to l2_loss_fde
+
 class Criterion(nn.Module):
     def __init__(self, config):
         super(Criterion, self).__init__()
         self.config = config
 
-    def forward(self, out, gt, center_gt_final_valid_idx):
+    def forward(self, out, gt,):
 
-        return self.nll_loss_multimodes(out, gt, center_gt_final_valid_idx)
+        return self.nll_loss_multimodes(out, gt,)
 
     def get_BVG_distributions(self, pred):
         B = pred.size(0)
@@ -433,7 +440,7 @@ class Criterion(nn.Module):
             # return (-biv_gauss_dist.log_prob(data_reshaped)).sum(dim=(1, 2))  # Laplace
             return ((-biv_gauss_dist.log_prob(data_reshaped)).sum(dim=2) * mask).sum(1)  # Laplace
 
-    def nll_loss_multimodes(self, output, data, center_gt_final_valid_idx):
+    def nll_loss_multimodes(self, output, data, ):
         """NLL loss multimodes for training. MFP Loss function
         Args:
           pred: [K, T, B, 5]
@@ -501,4 +508,65 @@ class Criterion(nn.Module):
         ade_loss = (torch.norm((pred[:, :, :, :2].transpose(1, 2) - data[:, :, :2].unsqueeze(0)), 2,
                                dim=-1) * mask.unsqueeze(0)).mean(dim=2).transpose(0, 1)
         loss, min_inds = (fde_loss + ade_loss).min(dim=1)
-        return 100.0 * loss.mean()
+        return loss.mean()
+    
+
+
+class Criterion_fde(nn.Module):
+    
+    """Loss for single mode for training"""
+    
+    def __init__(self, config):
+        super(Criterion_fde, self).__init__()
+        self.config = config
+
+    
+    def forward(self, out, gt, ):
+
+        return self.fde_bivariate_loss(out, gt, )
+
+
+    def fde_bivariate_loss(self, output, data,):
+        
+        """ 
+        data.shape = [B, N, T , x,y,mask]
+        pred.shape = [B, N , T, 5] 5-> mx, my, sx, sy, rho
+        mask.shape = [B, N, T]
+        """
+        
+        pred = output
+        mask = data[..., -1]
+        
+        
+        #fde_ade_loss
+        fde_loss = (torch.norm((pred[:, :, -1, :2] - data[:, :, -1, :2]), 2, dim=-1) * mask[:, :, -1])
+        ade_loss = (torch.norm((pred[:, :, :, :2]- data[:, :, :, :2]), 2, dim=-1) * mask).mean(dim=2)
+        
+        loss = fde_loss.mean() + ade_loss.mean()
+        fde_ade_loss = 100 * loss
+        
+        #bivariate loss 
+        normx = (pred[:, :, :, 0] - data[:, :, :, 0])
+        normy = (pred[:, :, :, 1] - data[:, :, :, 1])
+        sx = pred[:, :, :, 2]
+        sy = pred[:, :, :, 3]
+        rho = pred[:, :, :, 4]
+        
+        sxsy = sx * sy
+        
+        z = (normx/sx)**2 + (normy/sy)**2 - 2*((rho*normx*normy)/sxsy)
+        negRho = 1 - rho**2
+        
+        result = torch.exp(-z/(2*negRho))
+        denom = 2 * np.pi * (sxsy * torch.sqrt(negRho))
+        
+        result = result / denom
+        epsilon = 1e-20
+        result = (-torch.log(torch.clamp(result, min = epsilon))) * mask
+        result = torch.mean(result) 
+        bivariate_loss = result 
+        
+        
+        final_loss = bivariate_loss + fde_ade_loss
+        
+        return final_loss
