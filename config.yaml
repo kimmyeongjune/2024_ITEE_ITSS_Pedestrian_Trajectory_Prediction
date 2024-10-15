@@ -1,0 +1,289 @@
+#unitraj
+#overall_setting
+defaults:
+  - method: autobot 
+seed: 42
+exp_name: 'test'
+ckpt_path: null # checkpoint path, used for evaluation
+debug: True # debug mode, will use cpu only #False #True가 gpu쓰는거임
+devices: [ 0 ] # gpu ids
+#model & data related
+past_len: &past_len 3
+future_len: &future_len 7
+load_num_workers: &load_num_workers 0
+
+#mmdetection
+voxel_size: [0.075, 0.075, 0.2]
+point_cloud_range: &point_cloud_range [-54.0, -54.0, -5.0, 54.0, 54.0, 3.0]
+class_names: &class_names [
+    'car', 'truck', 'construction_vehicle', 'bus', 'trailer', 'barrier',
+    'motorcycle', 'bicycle', 'pedestrian', 'traffic_cone'
+]
+input_modality: &input_modality    
+    use_lidar: True 
+    use_camera: True
+dataset_type: &dataset_type 'NuscenesDataset'
+data_root: &data_root 'data/nuscenes/'
+db_sampler: &db_sampler
+    data_root: *data_root
+    info_path: 'data/nuscenes/nuscenes_dbinfos_train.pkl'
+    rate: 1.0
+    prepare:
+        filter_by_difficulty: [-1]
+        filter_by_min_points:
+            car: 5
+            truck: 5
+            trailer: 5
+            construction_vehicle: 5
+            traffic_cone: 5
+            barrier: 5
+            motorcycle: 5
+            bicycle: 5
+            pedestrian: 5
+    classes: *class_names
+    sample_groups: 
+        car: 2
+        truck: 3
+        trailer: 6
+        construction_vehicle: 7
+        traffic_cone: 2
+        barrier: 2
+        motorcycle: 6
+        bicycle: 6
+        pedestrian: 2
+    points_loader:
+        type: 'LoadPointsFromFile'
+        coord_type: 'LIDAR'
+        load_dim: 5
+        use_dim: [0, 1, 2, 3, 4]
+        backend_args: null
+
+train_pipeline: &train_pipeline [
+    {
+        type: 'BEVLoadMultiViewImageFromFiles',
+        to_float32: True,
+        color_type: 'color',
+        backend_args: null
+    },
+    { 
+        type: 'LoadPointsFromFile',
+        coord_type: 'LIDAR',
+        load_dim: 5,
+        use_dim: 5,
+        backend_args: null
+    },
+    { 
+        type: 'LoadPointsFromMultiSweeps',
+        sweeps_num: 9,
+        load_dim: 5,
+        use_dim: 5,
+        pad_empty_sweeps: True,
+        remove_close: True,
+        backend_args: null
+    },
+    { 
+        type: 'LoadAnnotations3D',
+        with_bbox_3d: True,
+        with_label_3d: True,
+        with_attr_label: False
+    },
+    {
+        type: 'ImageAug3D',
+        final_dim: [256, 704],
+        resize_lim: [0.38, 0.55],
+        bot_pct_lim: [0.0, 0.0],
+        rot_lim: [-5.4, 5.4],
+        rand_flip: True,
+        is_train: True
+    },
+    {
+        type: 'BEVFusionGlobalRotScaleTrans',
+        scale_ratio_range: [0.9, 1.1],
+        rot_range: [-0.78539816, 0.78539816],
+        translation_std: 0.5
+    },
+    { 
+        type: 'BEVFusionRandomFlip3D'
+    },
+    { 
+        type: 'PointsRangeFilter', 
+        point_cloud_range: *point_cloud_range
+    },
+    {
+        type: 'ObjectRangeFilter', 
+        point_cloud_range: *point_cloud_range
+    },
+    {
+        type: 'ObjectNameFilter',
+        classes: ['car', 'truck', 'construction_vehicle', 'bus', 'trailer',
+            'barrier', 'motorcycle', 'bicycle', 'pedestrian', 'traffic_cone']
+    },
+    {
+        type: 'GridMask',
+        use_h: True,
+        use_w: True,
+        max_epoch: 6,
+        rotate: 1,
+        offset: False,
+        ratio: 0.5,
+        mode: 1,
+        prob: 0.0,
+        fixed_prob: True
+    },
+    {
+        type: 'PointShuffle'
+    },
+    {
+        type: 'Pack3DDetInputs',
+        keys: [
+            'points', 'img', 'gt_bboxes_3d', 'gt_labels_3d', 'gt_bboxes',
+            'gt_labels'],
+        meta_keys: [
+            'cam2img', 'ori_cam2img', 'lidar2cam', 'lidar2img', 'cam2lidar',
+            'ori_lidar2img', 'img_aug_matrix', 'box_type_3d', 'sample_idx',
+            'lidar_path', 'img_path', 'transformation_3d_flow', 'pcd_rotation',
+            'pcd_scale_factor', 'pcd_trans', 'img_aug_matrix',
+            'lidar_aug_matrix', 'num_pts_feats']
+    }
+]
+
+test_pipeline: &test_pipeline [
+    {
+        type: 'BEVLoadMultiViewImageFromFiles',
+        to_float32: True,
+        color_type: 'color',
+        backend_args: null
+    },
+    {
+        type: 'LoadPointsFromFile',
+        coord_type: 'LIDAR',
+        load_dim: 5,
+        use_dim: 5,
+        backend_args: null
+    },
+    {
+        type: 'LoadPointsFromMultiSweeps',
+        sweeps_num: 9,
+        load_dim: 5,
+        use_dim: 5,
+        pad_empty_sweeps: True,
+        remove_close: True,
+        backend_args: null
+    },
+    {
+        type: 'ImageAug3D',
+        final_dim: [256, 704],
+        resize_lim: [0.48, 0.48],
+        bot_pct_lim: [0.0, 0.0],
+        rot_lim: [0.0, 0.0],
+        rand_flip: False,
+        is_train: False
+    },
+    {
+        type: 'PointsRangeFilter',
+        point_cloud_range: [-54.0, -54.0, -5.0, 54.0, 54.0, 3.0]
+    },
+    {
+        type: 'Pack3DDetInputs',
+        keys: ['img', 'points', 'gt_bboxes_3d', 'gt_labels_3d'],
+        meta_keys: [
+            'cam2img', 'ori_cam2img', 'lidar2cam', 'lidar2img', 'cam2lidar',
+            'ori_lidar2img', 'img_aug_matrix', 'box_type_3d', 'sample_idx',
+            'lidar_path', 'img_path', 'num_pts_feats', 'num_views']
+    }
+]
+
+
+
+TRAIN:
+    dataset_name: combnuscenes
+    TRAJ_DATASET:
+        model_name: autobot
+        load_num_workers: *load_num_workers # number of workers for loading data
+        train_data_path: [ "data/nuscenes/trajectory_converted_1fps_train" ] # list of paths to the training data
+        val_data_path: [ "data/nuscenes/trajectory_converted_1fps_val" ] # list of paths to the validation data
+        max_data_num: [ 100000 ] # maximum number of data for each training dataset
+        past_len: *past_len # history trajectory length, 3s
+        future_len: *future_len # future trajectory length, 7s
+        object_type: [ 'PEDESTRIAN']#, 'CYCLIST', 'VEHICLE'] # object types included in the training set
+        line_type: [ 'lane','stop_sign','road_edge','road_line','crosswalk','speed_bump' ] # line type to be considered in the input
+        masked_attributes: [ 'z_axis', 'size' ] # attributes to be masked in the input
+        trajectory_sample_interval: 1 #이거 안쓰는거임
+        only_train_on_ego: True # only train on AV
+        center_offset_of_map: [ 30.0, 0.0 ] # center offset of the map
+        use_cache: False # use cache for data loading
+        overwrite_cache: False # overwrite existing cache
+        store_data_in_memory: False # store data in memory
+        #MODIFY
+        fps: 2 #nuscens: 2 ,argoverse: 10, itee_itss: 1 
+        skip: 1 #interval of skip, example 1fps = 1skip
+
+        # official evaluation
+        nuscenes_dataroot: '/mnt/nas3_rcp_enac_u0900_vita_scratch/datasets/Prediction-Dataset/nuscenes/nuscenes_root'
+        eval_nuscenes: False # whether to evaluate with nuscenes evaluation tool
+        eval_waymo: False # whether to evaluate with waymo evaluation tool
+
+
+    SENSOR_DATASET:
+        ann_file: 'nuscenes_infos_train.pkl'
+        metainfo:
+            classes: *class_names
+        data_root: *data_root
+        data_prefix:
+            pts: 'samples/LIDAR_TOP'
+            CAM_FRONT: 'samples/CAM_FRONT'
+            CAM_FRONT_LEFT: 'samples/CAM_FRONT_LEFT'
+            CAM_FRONT_RIGHT: 'samples/CAM_FRONT_RIGHT'
+            CAM_BACK: 'samples/CAM_BACK'
+            CAM_BACK_RIGHT: 'samples/CAM_BACK_RIGHT'
+            CAM_BACK_LEFT: 'samples/CAM_BACK_LEFT'
+            sweeps: 'sweeps/LIDAR_TOP'
+        pipeline: *train_pipeline
+        modality: *input_modality
+        test_mode: False
+VAL:
+    dataset_name: combnuscenes
+    TRAJ_DATASET:
+        model_name: autobot
+        load_num_workers: *load_num_workers # number of workers for loading data
+        train_data_path: [ "data/nuscenes/trajectory_converted_1fps_train" ] # list of paths to the training data
+        val_data_path: [ "data/nuscenes/trajectory_converted_1fps_val" ] # list of paths to the validation data
+        max_data_num: [ 100000 ] # maximum number of data for each training dataset
+        past_len: *past_len # history trajectory length, 3s
+        future_len: *future_len # future trajectory length, 7s
+        object_type: [ 'VEHICLE' , 'PEDESTRIAN']#, 'CYCLIST'] # object types included in the training set
+        line_type: [ 'lane','stop_sign','road_edge','road_line','crosswalk','speed_bump' ] # line type to be considered in the input
+        masked_attributes: [ 'z_axis', 'size' ] # attributes to be masked in the input
+        trajectory_sample_interval: 1 #이거 안쓰는거임
+        only_train_on_ego: True # only train on AV
+        center_offset_of_map: [ 30.0, 0.0 ] # center offset of the map
+        use_cache: False # use cache for data loading
+        overwrite_cache: False # overwrite existing cache
+        store_data_in_memory: False # store data in memory
+        #MODIFY
+        fps: 2 #nuscens: 2 ,argoverse: 10, itee_itss: 1 
+        skip: 1 #interval of skip, example 1fps = 1skip
+
+        # official evaluation
+        nuscenes_dataroot: '/mnt/nas3_rcp_enac_u0900_vita_scratch/datasets/Prediction-Dataset/nuscenes/nuscenes_root'
+        eval_nuscenes: False # whether to evaluate with nuscenes evaluation tool
+        eval_waymo: False # whether to evaluate with waymo evaluation tool
+
+
+    SENSOR_DATASET:
+        ann_file: 'nuscenes_infos_val.pkl'
+        metainfo:
+            classes: *class_names
+        data_root: *data_root
+        data_prefix:
+            pts: 'samples/LIDAR_TOP'
+            CAM_FRONT: 'samples/CAM_FRONT'
+            CAM_FRONT_LEFT: 'samples/CAM_FRONT_LEFT'
+            CAM_FRONT_RIGHT: 'samples/CAM_FRONT_RIGHT'
+            CAM_BACK: 'samples/CAM_BACK'
+            CAM_BACK_RIGHT: 'samples/CAM_BACK_RIGHT'
+            CAM_BACK_LEFT: 'samples/CAM_BACK_LEFT'
+            sweeps: 'sweeps/LIDAR_TOP'
+        pipeline: *test_pipeline
+        modality: *input_modality
+        test_mode: True
