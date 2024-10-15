@@ -3,7 +3,7 @@ import pickle
 import shutil
 from collections import defaultdict
 from multiprocessing import Pool
-
+import random
 import numpy as np
 import torch
 from metadrive.scenario.scenario_description import MetaDriveType
@@ -32,7 +32,8 @@ class BaseDataset(Dataset):
         self.is_validation = is_validation
         self.config = config #config를 받아와서 self.config에 넘겨줌
         self.data_loaded_memory = []
-        self.data_chunk_size = 8
+        #MODIFY default = 8
+        self.data_chunk_size = 1
         self.load_data() #load_data를 여기에 구성해놨음
 
     def load_data(self):
@@ -44,10 +45,9 @@ class BaseDataset(Dataset):
 
         for cnt, data_path in enumerate(self.data_path): 
             dataset_name = data_path.split('/')[-1] #dataset_name은 data_path에서 쪼개서 가지고오고
-            self.cache_path = os.path.join(data_path, f'cache_{self.config.method.model_name}') #cache_path는 config안에서 쓰는 model_name을 가지고 cache_를 붙여서 가지고옴
+            self.cache_path = os.path.join(data_path, f'cache_{self.config.model_name}') #cache_path는 config안에서 쓰는 model_name을 가지고 cache_를 붙여서 가지고옴
 
             data_usage_this_dataset = self.config['max_data_num'][cnt] #이 dataset에서 쓰이는 data의 양을 config에서 가지고 온다.
-            #MJTODO: data_chunk_size가 의미하는 게 무엇인지
             data_usage_this_dataset = int(data_usage_this_dataset / self.data_chunk_size) # 그 dataset의 양을 chunk로 나누어서 쪼개버림-> 1000/8 ->125
             if self.config['use_cache'] or is_ddp():
                 file_list = self.get_data_list(data_usage_this_dataset)
@@ -76,12 +76,13 @@ class BaseDataset(Dataset):
 
                     # results = self.process_data_chunk(0)
                     with Pool(processes=process_num) as pool:
-                        results = pool.map(self.process_data_chunk, list(range(process_num))) #이제 여기서 process_data_chunk함수 안으로 쇼로록
+                        results_list = pool.map(self.process_data_chunk, list(range(process_num))) #이제 여기서 process_data_chunk함수 안으로 쇼로록
 
                     # concatenate the results
                     file_list = {}
-                    for result in results:
-                        file_list.update(result)
+                    for results in results_list:
+                        for result in results:
+                            file_list.update(result)
 
                     with open(os.path.join(self.cache_path, 'file_list.pkl'), 'wb') as f:
                         pickle.dump(file_list, f)
@@ -122,328 +123,360 @@ class BaseDataset(Dataset):
                 print(f'{cnt}/{len(data_list)} data processed', flush=True)
 
             scenario = read_scenario(data_path, mapping, file_name) # read_scenario를 하는 부분, data를 받아와서 실질적인 값 (어떤거 받아오는지는 read_scenario함수 가서 봐보면 됨)
-
+            file_list_list = []
             try:
                 output = self.preprocess(scenario) #preprocess진행
 
                 output = self.process(output) #preprocess끝난 다음에 그 output을 process로 넘김 output =ret_list를 가지고옴 ret_list의 구성은 process함수 안에서 볼 수 있음
 
-                output = self.postprocess(output)
+                output_list = self.postprocess(output)
+#output은 15개의 list 
 
             except Exception as e:
                 print('Error: {} in {}'.format(e, file_name))
                 output = None
+            for output in output_list:
+                if output is None: continue
 
-            if output is None: continue
+                output_buffer += output
 
-            output_buffer += output
+                while len(output_buffer) >= self.data_chunk_size:
+                    save_path = os.path.join(self.cache_path, f'{worker_index}_{save_cnt}.pkl')
+                    to_save = output_buffer[:self.data_chunk_size]
+                    output_buffer = output_buffer[self.data_chunk_size:]
+                    with open(save_path, 'wb') as f:
+                        pickle.dump(to_save, f)
+                    save_cnt += 1
+                    file_info = {}
+                    kalman_difficulty = np.stack([x['kalman_difficulty'] for x in to_save])
+                    file_info['kalman_difficulty'] = kalman_difficulty
+                    file_info['sample_num'] = len(to_save)
+                    file_list[save_path] = file_info
 
-            while len(output_buffer) >= self.data_chunk_size:
-                save_path = os.path.join(self.cache_path, f'{worker_index}_{save_cnt}.pkl')
-                to_save = output_buffer[:self.data_chunk_size]
-                output_buffer = output_buffer[self.data_chunk_size:]
+            save_path = os.path.join(self.cache_path, f'{worker_index}_{save_cnt}.pkl')
+            # if output_buffer is not a list
+            if isinstance(output_buffer, dict):
+                output_buffer = [output_buffer]
+            if len(output_buffer) > 0:
                 with open(save_path, 'wb') as f:
-                    pickle.dump(to_save, f)
-                save_cnt += 1
+                    pickle.dump(output_buffer, f)
                 file_info = {}
-                kalman_difficulty = np.stack([x['kalman_difficulty'] for x in to_save])
+                kalman_difficulty = np.stack([x['kalman_difficulty'] for x in output_buffer])
                 file_info['kalman_difficulty'] = kalman_difficulty
-                file_info['sample_num'] = len(to_save)
+                file_info['sample_num'] = len(output_buffer)
                 file_list[save_path] = file_info
+            file_list_list.append(file_list)
 
-        save_path = os.path.join(self.cache_path, f'{worker_index}_{save_cnt}.pkl')
-        # if output_buffer is not a list
-        if isinstance(output_buffer, dict):
-            output_buffer = [output_buffer]
-        if len(output_buffer) > 0:
-            with open(save_path, 'wb') as f:
-                pickle.dump(output_buffer, f)
-            file_info = {}
-            kalman_difficulty = np.stack([x['kalman_difficulty'] for x in output_buffer])
-            file_info['kalman_difficulty'] = kalman_difficulty
-            file_info['sample_num'] = len(output_buffer)
-            file_list[save_path] = file_info
+        return file_list_list #각각의 sample의 pkl이 들어있는 경로와 과 kalman_difficulty, sample_num을 저장한 것을 file_list에 넣는다.
 
-        return file_list #각각의 sample의 pkl이 들어있는 경로와 과 kalman_difficulty, sample_num을 저장한 것을 file_list에 넣는다.
-
-    def preprocess(self, scenario): #scnario에 값을 받아오고 여기서 preprocess를 진행함
-
+    def preprocess(self, scenario):
         traffic_lights = scenario['dynamic_map_states']
-        tracks = scenario['tracks'] #tracks는 맵이 아니라 agent를 의미하는 단어임, 헷갈리지 맙시다. tracks==pedestrian, vehicle, cyclist
+        tracks = scenario['tracks']
         map_feat = scenario['map_features']
+        track_length = scenario["length"]
 
-        past_length = self.config['past_len'] #21
-        future_length = self.config['future_len'] #60
-        total_steps = past_length + future_length #81
-        trajectory_sample_interval = self.config['trajectory_sample_interval'] #1
-        frequency_mask = generate_mask(past_length - 1, total_steps, trajectory_sample_interval) #total_step만큼의 mask를 만들어버리기 (81,)
-
-        track_infos = { #track_infos를 만들기 초기화 단계
-            'object_id': [], 
-            'object_type': [],  #{'UNSET': 0, 'VEHICLE': 1, 'PEDESTRIAN': 2, 'CYCLIST': 3, 'OTHER': 4})여긴 숫자로 mapping
-            'trajs': []
-        }
-
-        for k, v in tracks.items(): #k는 각 모든 객체, v는 그 객체에 따른 모든 정보
-
-            state = v['state'] #len() = 7 position, heading, velocity, valid, length, width, height
-            for key, value in state.items():
-                if len(value.shape) == 1: #value의 길이는 76-> track_length
-                    state[key] = np.expand_dims(value, axis=-1)
-            all_state = [state['position'], state['length'], state['width'], state['height'], state['heading'],
-                         state['velocity'], state['valid']] #하나로 묶어서 all_state라는 list에 넣음
-            # type, x,y,z,l,w,h,heading,vx,vy,valid 라는 정보를 담고 있음
-            all_state = np.concatenate(all_state, axis=-1) #concat해서 total_step에 맞게 모든 정보를 묶어서 len했을때 이제 위 정보를 담고 있는 갯수(10개)가 아니라 track_length개가 되게끔함
-            # all_state = all_state[::sample_inverval]
-            if all_state.shape[0] < total_steps: #맞으면 여기는 안들어감, 안맞으면 그냥 마지막 값으로 다 padding을 해버려서 길이를 맞춰버림
-                all_state = np.pad(all_state, ((total_steps - all_state.shape[0], 0), (0, 0)))
-            all_state = all_state[:total_steps]
-
-            assert all_state.shape[0] >= total_steps, f'Error: {all_state.shape[0]} < {total_steps}' #가지고 있는 궤적 정보의 길이가 더 짧으면 안된다는 뜻 내가 추정해야할 길이보다 
-
-            track_infos['object_id'].append(k)
-            track_infos['object_type'].append(object_type[v['type']]) #{'UNSET': 0, 'VEHICLE': 1, 'PEDESTRIAN': 2, 'CYCLIST': 3, 'OTHER': 4})
-            track_infos['trajs'].append(all_state) # 궤적 정보를 담는 , 그래서 실질적으로 track_infos안에 모든 객체에 대해서 모든 정보를 담는다
-
-        track_infos['trajs'] = np.stack(track_infos['trajs'], axis=0) #-> (70,81,10)->(num_objects, timestamps, info)
-        # scenario['metadata']['ts'] = scenario['metadata']['ts'][::sample_inverval]
-        track_infos['trajs'][..., -1] *= frequency_mask[np.newaxis]
-        scenario['metadata']['ts'] = scenario['metadata']['ts'][:total_steps] #시간 step의 값을 담고 있는 부분 -> 0~8.0까지 0.1초 단위로 값을 가짐
-
-        # x,y,z,type
-        map_infos = { #map_infos를 만들기 위해서 초기화 하는 단계
-            'lane': [],
-            'road_line': [],
-            'road_edge': [],
-            'stop_sign': [],
-            'crosswalk': [],
-            'speed_bump': [],
-        }
-        polylines = []
-        point_cnt = 0
-        for k, v in map_feat.items(): #k는 boudary와 map_object의 id인듯, v는 그에 대한 모든 정보
-            type = polyline_type[v['type']] #-> 객체 처럼 표가 있고, 숫자로 mapping이 됨
-            if type == 0:
-                continue
-
-            cur_info = {'id': k} #cur_info라는 녀석을 만듬
-            cur_info['type'] = v['type']
-            if type in [1, 2, 3]:
-                cur_info['speed_limit_mph'] = v.get('speed_limit_mph', None)
-                cur_info['interpolating'] = v.get('interpolating', None)
-                cur_info['entry_lanes'] = v.get('entry_lanes', None)
-                try:
-                    cur_info['left_boundary'] = [{
-                        'start_index': x['self_start_index'], 'end_index': x['self_end_index'],
-                        'feature_id': x['feature_id'],
-                        'boundary_type': 'UNKNOWN'  # roadline type
-                    } for x in v['left_neighbor']
-                    ]
-                    cur_info['right_boundary'] = [{
-                        'start_index': x['self_start_index'], 'end_index': x['self_end_index'],
-                        'feature_id': x['feature_id'],
-                        'boundary_type': 'UNKNOWN'  # roadline type
-                    } for x in v['right_neighbor']
-                    ]
-                except:
-                    cur_info['left_boundary'] = []
-                    cur_info['right_boundary'] = []
-                polyline = v['polyline']
-                polyline = interpolate_polyline(polyline)
-                map_infos['lane'].append(cur_info)
-            elif type in [6, 7, 8, 9, 10, 11, 12, 13]: #일단 여기에 걸렸음 ROAD_LINE_SOLID_SINGLE_WHIITE는 7로 mapping되서 그런듯
-                polyline = v['polyline']
-                polyline = interpolate_polyline(polyline)
-                map_infos['road_line'].append(cur_info)
-            elif type in [15, 16]:
-                polyline = v['polyline']
-                polyline = interpolate_polyline(polyline)
-                cur_info['type'] = 7
-                map_infos['road_line'].append(cur_info)
-            elif type in [17]:
-                cur_info['lane_ids'] = v['lane']
-                cur_info['position'] = v['position']
-                map_infos['stop_sign'].append(cur_info)
-                polyline = v['position'][np.newaxis]
-            elif type in [18]:
-                map_infos['crosswalk'].append(cur_info)
-                polyline = v['polygon']
-            elif type in [19]:
-                map_infos['crosswalk'].append(cur_info)
-                polyline = v['polygon']
-            if polyline.shape[-1] == 2: #3이라서 안걸림
-                polyline = np.concatenate((polyline, np.zeros((polyline.shape[0], 1))), axis=-1)
-            try:
-                cur_polyline_dir = get_polyline_dir(polyline)
-                type_array = np.zeros([polyline.shape[0], 1])
-                type_array[:] = type #아까 가지고 있던 type임
-                cur_polyline = np.concatenate((polyline, cur_polyline_dir, type_array), axis=-1)
-            except:
-                cur_polyline = np.zeros((0, 7), dtype=np.float32)
-            polylines.append(cur_polyline)
-            cur_info['polyline_index'] = (point_cnt, point_cnt + len(cur_polyline))
-            point_cnt += len(cur_polyline)
-
-        try:
-            polylines = np.concatenate(polylines, axis=0).astype(np.float32)
-        except:
-            polylines = np.zeros((0, 7), dtype=np.float32)
-        map_infos['all_polylines'] = polylines #map_infos안에 모든 정보들을 모음
-
-        dynamic_map_infos = { 
-            'lane_id': [],
-            'state': [],
-            'stop_point': []
-        }
-        for k, v in traffic_lights.items():  # (num_timestamp) #scenario['dynamic_map_states']의 값을 가지고 만든다
-            lane_id, state, stop_point = [], [], []
-            for cur_signal in v['state']['object_state']:  # (num_observed_signals)
-                lane_id.append(str(v['lane']))
-                state.append(cur_signal)
-                stop_point.append(v['stop_point'].tolist())
-            # lane_id = lane_id[::sample_inverval]
-            # state = state[::sample_inverval]
-            # stop_point = stop_point[::sample_inverval]
-            lane_id = lane_id[:total_steps]
-            state = state[:total_steps]
-            stop_point = stop_point[:total_steps]
-            dynamic_map_infos['lane_id'].append(np.array([lane_id]))
-            dynamic_map_infos['state'].append(np.array([state]))
-            dynamic_map_infos['stop_point'].append(np.array([stop_point]))
-
-        ret = { #그래서 위에서 각각 취합한 정보를 ret에 다 넣음
-            'track_infos': track_infos, #우리는 map에 대해서는 아직 안보니까, 실질적으로는 이부분만 집중해서 보면될듯
-            'dynamic_map_infos': dynamic_map_infos,
-            'map_infos': map_infos
-        }
-        ret.update(scenario['metadata']) #metadata의 key, value값을 넣어줌
-        ret['timestamps_seconds'] = ret.pop('ts') #ts를 timestamps_seconds로 바꿔줌
-        ret['current_time_index'] = self.config['past_len'] - 1 #현재 time_index는 past_len에서 1뺀거니깐 ㅇㅇ
-        ret['sdc_track_index'] = track_infos['object_id'].index(ret['sdc_id']) #여기서 ego에 대한 index를 sdc_track_index로 가지고옴, 그래서 track_infos의 object_id에서 sdc_id의 index를 보면 ego임
-        if self.config['only_train_on_ego'] or ret.get('tracks_to_predict', None) is None: #여기는 안들어감 //나중에 우리는 이걸 config에 넣어주면 될듯
-            tracks_to_predict = {
-                'track_index': [ret['sdc_track_index']],
-                'difficulty': [0],
-                'object_type': [MetaDriveType.VEHICLE]
-            }
-        else:
-            sample_list = list(ret['tracks_to_predict'].keys())  # + ret.get('objects_of_interest', []) # tracks_to_predic로 뽑힌 객체의 정보가 담겨있는데, 그 중 key 즉, track_id만 가지고온다.
-            sample_list = list(set(sample_list))
-
-            tracks_to_predict = { #tracks_to_predict를 여기서 정의해줌, 근데 이미 정의 되어있는 값 가지고 오는거 
-                'track_index': [track_infos['object_id'].index(id) for id in sample_list if
-                                id in track_infos['object_id']], #여기서 track_index를 가지고 오고
-                'object_type': [track_infos['object_type'][track_infos['object_id'].index(id)] for id in sample_list if
-                                id in track_infos['object_id']], #objct_type도 여기서 가지고 오네요
-            } #그래서 내가 최종적으로 tracks_to_predict는 track_index랑 object_type에 대한 정보를 가지고 있다.
-
-        ret['tracks_to_predict'] = tracks_to_predict #이걸 ret에 추가해준다
-
-        ret['map_center'] = scenario['metadata'].get('map_center', np.zeros(3))[np.newaxis]
-        return ret
-
-    def process(self, internal_format): #MJTODO: center_objects가 뭔지 // internal_format은 preprocess의 결과물이 넘어온다.
-
-        info = internal_format
-        scene_id = info['scenario_id']
-
-        sdc_track_index = info['sdc_track_index'] #ego의 track_index를 sdc_track_index로 저장 -> info["track_infos"]["object_id"][sdc_track_index]를 하면 ego가 나올거임
-        current_time_index = info['current_time_index'] #현재 time은 위에서 구하는 방식에 의해서 구해지고 그걸 current_time_index로 저장
-        timestamps = np.array(info['timestamps_seconds'][:current_time_index + 1], dtype=np.float32) #current_time_index를 이용해서 timestamp를 지정한 길이만크 current_time까지 시간대를 저장 -> 예시 curr = 20(index라서 2.1초), 길이 = (21) , [0, 0.1,..., 2.0]
-
-        track_infos = info['track_infos'] #track_infos안에는 object_id, object_type, trajs로 구성되어 있음
-
-        track_index_to_predict = np.array(info['tracks_to_predict']['track_index']) #tacks_to_predict의 track_index를 track_index_to_predict로 저장
-        obj_types = np.array(track_infos['object_type']) #object_type을 저장, 이건 tracks_to_predict만이 아니라 scene안의 모든 객체(num_objects)의 type 
-        obj_trajs_full = track_infos['trajs']  # (num_objects, num_timestamp, 10) -> 여기의 num_timestamp는 timestamps랑은 다름 전자는 81초 즉, 모든 시간대의 정보, 후자는 내가 봐여할 길이만큼 처리된 길이
-        obj_trajs_past = obj_trajs_full[:, :current_time_index + 1] #그래서 여기서 current_time_index를 가지고 과거의 정보를 가지고 옴 -> 21초
-        obj_trajs_future = obj_trajs_full[:, current_time_index + 1:] #위와 마찬가지로 current_time_index를 가지고 미래의 정보를 가지고 옴 -> 60초
-
-        center_objects, track_index_to_predict = self.get_interested_agents( #MJTODO: 여기서 center_objects를 만드는 부분
-            track_index_to_predict=track_index_to_predict,
-            obj_trajs_full=obj_trajs_full,
-            current_time_index=current_time_index,
-            obj_types=obj_types, scene_id=scene_id
-        ) #get_interested_agents 함수를 거쳐서 나온 결과물은 center_objects에 대한 current_timestamp에 대한 trajs정보와 center_objects의 track_index를 가지고온다.
-        if center_objects is None: return None
-
-        sample_num = center_objects.shape[0] #일단 처음은 하나
-
-        (obj_trajs_data, obj_trajs_mask, obj_trajs_pos, obj_trajs_last_pos, obj_trajs_future_state,
-         obj_trajs_future_mask, center_gt_trajs,
-         center_gt_trajs_mask, center_gt_final_valid_idx,
-         track_index_to_predict_new) = self.get_agent_data( #get_agent_data 
-            center_objects=center_objects, obj_trajs_past=obj_trajs_past, obj_trajs_future=obj_trajs_future,
-            track_index_to_predict=track_index_to_predict, sdc_track_index=sdc_track_index,
-            timestamps=timestamps, obj_types=obj_types
-        )
-
-        ret_dict = { #MJTODO: ret_list의 구성
-            'scenario_id': np.array([scene_id] * len(track_index_to_predict)),
-            'obj_trajs': obj_trajs_data,
-            'obj_trajs_mask': obj_trajs_mask,
-            'track_index_to_predict': track_index_to_predict_new,  # used to select center-features
-            'obj_trajs_pos': obj_trajs_pos,
-            'obj_trajs_last_pos': obj_trajs_last_pos,
-
-            'center_objects_world': center_objects,
-            'center_objects_id': np.array(track_infos['object_id'])[track_index_to_predict],
-            'center_objects_type': np.array(track_infos['object_type'])[track_index_to_predict],
-            'map_center': info['map_center'],
-
-            'obj_trajs_future_state': obj_trajs_future_state,
-            'obj_trajs_future_mask': obj_trajs_future_mask,
-            'center_gt_trajs': center_gt_trajs,
-            'center_gt_trajs_mask': center_gt_trajs_mask,
-            'center_gt_final_valid_idx': center_gt_final_valid_idx,
-            'center_gt_trajs_src': obj_trajs_full[track_index_to_predict]
-        }
-
-        if info['map_infos']['all_polylines'].__len__() == 0:
-            info['map_infos']['all_polylines'] = np.zeros((2, 7), dtype=np.float32)
-            print(f'Warning: empty HDMap {scene_id}')
-
-        if self.config.manually_split_lane:
-            map_polylines_data, map_polylines_mask, map_polylines_center = self.get_manually_split_map_data(
-                center_objects=center_objects, map_infos=info['map_infos'])
-        else:
-            map_polylines_data, map_polylines_mask, map_polylines_center = self.get_map_data(
-                center_objects=center_objects, map_infos=info['map_infos'])
-
-        ret_dict['map_polylines'] = map_polylines_data
-        ret_dict['map_polylines_mask'] = map_polylines_mask.astype(bool)
-        ret_dict['map_polylines_center'] = map_polylines_center
-
-        # masking out unused attributes to Zero
-        masked_attributes = self.config['masked_attributes']
-        if 'z_axis' in masked_attributes:
-            ret_dict['obj_trajs'][..., 2] = 0
-            ret_dict['map_polylines'][..., 2] = 0
-        if 'size' in masked_attributes:
-            ret_dict['obj_trajs'][..., 3:6] = 0
-        if 'velocity' in masked_attributes:
-            ret_dict['obj_trajs'][..., 25:27] = 0
-        if 'acceleration' in masked_attributes:
-            ret_dict['obj_trajs'][..., 27:29] = 0
-        if 'heading' in masked_attributes:
-            ret_dict['obj_trajs'][..., 23:25] = 0
-
-        # change every thing to float32
-        for k, v in ret_dict.items():
-            if isinstance(v, np.ndarray) and v.dtype == np.float64:
-                ret_dict[k] = v.astype(np.float32)
-
-        ret_dict['map_center'] = ret_dict['map_center'].repeat(sample_num, axis=0)
-        ret_dict['dataset_name'] = [info['dataset']] * sample_num
+        past_length = self.config['past_len'] 
+        future_length = self.config['future_len']  
+        total_steps = past_length + future_length  
+        trajectory_sample_interval = self.config['trajectory_sample_interval']  
+        frequency_mask = generate_mask(past_length - 1, total_steps, trajectory_sample_interval)
+        #MODIFY
+        fps = self.config["fps"]
+        skip = int((1/ self.config["skip"]) * fps)
+        max_start_index = track_length - (total_steps * skip - (skip - 1))
+        start_indices = random.sample(range(max_start_index + 1), max_start_index)
+        
+        #MODIFY
+        scene_token = scenario['metadata']['scene_token']
 
         ret_list = []
-        for i in range(sample_num):
-            ret_dict_i = {}
-            for k, v in ret_dict.items():
-                ret_dict_i[k] = v[i]
-            ret_list.append(ret_dict_i)
+
+        for start_index in start_indices:
+            track_infos = {
+                'object_id': [],
+                'object_type': [],
+                'trajs': []
+            }
+
+            for k, v in tracks.items(): #k는 객체 v는 각 객체의 정보
+                state = v['state']
+                for key, value in state.items():
+                    if len(value.shape) == 1:
+                        state[key] = np.expand_dims(value, axis=-1)
+                all_state = [state['position'], state['length'], state['width'], state['height'], state['heading'], state['velocity'], state['valid']]
+                all_state = np.concatenate(all_state, axis=-1)
+            
+                if all_state.shape[0] < total_steps:
+                    all_state = np.pad(all_state, ((total_steps - all_state.shape[0], 0), (0, 0)))
+                
+                all_state = all_state[start_index:start_index + total_steps * skip:skip]
+                assert all_state.shape[0] == total_steps, f'Error: {all_state.shape[0]} < {total_steps}'
+
+                track_infos['object_id'].append(k)
+                track_infos['object_type'].append(object_type[v['type']])
+                track_infos['trajs'].append(all_state)
+
+            track_infos['trajs'] = np.stack(track_infos['trajs'], axis=0)
+            track_infos['trajs'][..., -1] *= frequency_mask[np.newaxis]
+
+            scenario['metadata']['ts_inter'] = scenario['metadata']['ts'][start_index: start_index + total_steps * skip: skip]
+            #MODIFY
+            #MJTODO: 이거 start_index 잘 담겨있는지 확인하기
+            scenario['metadata']['start_index'] = [start_index]
+
+            map_infos = {
+                'lane': [],
+                'road_line': [],
+                'road_edge': [],
+                'stop_sign': [],
+                'crosswalk': [],
+                'speed_bump': [],
+            }
+            polylines = []
+            point_cnt = 0
+            for k, v in map_feat.items():
+                type = polyline_type[v['type']]
+                if type == 0:
+                    continue
+
+                cur_info = {'id': k}
+                cur_info['type'] = v['type']
+                if type in [1, 2, 3]:
+                    cur_info['speed_limit_mph'] = v.get('speed_limit_mph', None)
+                    cur_info['interpolating'] = v.get('interpolating', None)
+                    cur_info['entry_lanes'] = v.get('entry_lanes', None)
+                    try:
+                        cur_info['left_boundary'] = [{
+                            'start_index': x['self_start_index'], 'end_index': x['self_end_index'],
+                            'feature_id': x['feature_id'],
+                            'boundary_type': 'UNKNOWN'
+                        } for x in v['left_neighbor']]
+                        cur_info['right_boundary'] = [{
+                            'start_index': x['self_start_index'], 'end_index': x['self_end_index'],
+                            'feature_id': x['feature_id'],
+                            'boundary_type': 'UNKNOWN'
+                        } for x in v['right_neighbor']]
+                    except:
+                        cur_info['left_boundary'] = []
+                        cur_info['right_boundary'] = []
+                    polyline = v['polyline']
+                    polyline = interpolate_polyline(polyline)
+                    map_infos['lane'].append(cur_info)
+                elif type in [6, 7, 8, 9, 10, 11, 12, 13]:
+                    polyline = v['polyline']
+                    polyline = interpolate_polyline(polyline)
+                    map_infos['road_line'].append(cur_info)
+                elif type in [15, 16]:
+                    polyline = v['polyline']
+                    polyline = interpolate_polyline(polyline)
+                    cur_info['type'] = 7
+                    map_infos['road_line'].append(cur_info)
+                elif type in [17]:
+                    cur_info['lane_ids'] = v['lane']
+                    cur_info['position'] = v['position']
+                    map_infos['stop_sign'].append(cur_info)
+                    polyline = v['position'][np.newaxis]
+                elif type in [18, 19]:
+                    map_infos['crosswalk'].append(cur_info)
+                    polyline = v['polygon']
+                if polyline.shape[-1] == 2:
+                    polyline = np.concatenate((polyline, np.zeros((polyline.shape[0], 1))), axis=-1)
+                try:
+                    cur_polyline_dir = get_polyline_dir(polyline)
+                    type_array = np.zeros([polyline.shape[0], 1])
+                    type_array[:] = type
+                    cur_polyline = np.concatenate((polyline, cur_polyline_dir, type_array), axis=-1)
+                except:
+                    cur_polyline = np.zeros((0, 7), dtype=np.float32)
+                polylines.append(cur_polyline)
+                cur_info['polyline_index'] = (point_cnt, point_cnt + len(cur_polyline))
+                point_cnt += len(cur_polyline)
+
+            try:
+                polylines = np.concatenate(polylines, axis=0).astype(np.float32)
+            except:
+                polylines = np.zeros((0, 7), dtype=np.float32)
+            map_infos['all_polylines'] = polylines
+
+            dynamic_map_infos = {
+                'lane_id': [],
+                'state': [],
+                'stop_point': []
+            }
+            for k, v in traffic_lights.items():
+                lane_id, state, stop_point = [], [], []
+                for cur_signal in v['state']['object_state']:
+                    lane_id.append(str(v['lane']))
+                    state.append(cur_signal)
+                    stop_point.append(v['stop_point'].tolist())
+                lane_id = lane_id[:total_steps]
+                state = state[:total_steps]
+                stop_point = stop_point[:total_steps]
+                dynamic_map_infos['lane_id'].append(np.array([lane_id]))
+                dynamic_map_infos['state'].append(np.array([state]))
+                dynamic_map_infos['stop_point'].append(np.array([stop_point]))
+
+            ret = {
+                'track_infos': track_infos,
+                'dynamic_map_infos': dynamic_map_infos,
+                'map_infos': map_infos
+            }
+            ret.update(scenario['metadata'])
+            ret['timestamps_seconds'] = ret["ts_inter"]
+            #MODIFY
+            ret['timestamp_token'] = ret['timestamp_ns'][start_index: start_index + total_steps * skip: skip]
+            ret.pop('ts_inter')
+            ret['current_time_index'] = self.config['past_len'] - 1
+            ret['sdc_track_index'] = track_infos['object_id'].index(ret['sdc_id'])
+            if self.config['only_train_on_ego'] or ret.get('tracks_to_predict', None) is None:
+                tracks_to_predict = {
+                    'track_index': [ret['sdc_track_index']],
+                    'difficulty': [0],
+                    'object_type': [MetaDriveType.VEHICLE] #MODIFY 아마 여기를 EGO이런식으로 바꾸고 VEHICLE이랑은 다르게 mapping이 되어야 할 것 같은 느낌
+                }
+            else:
+                sample_list = list(ret['tracks_to_predict'].keys())
+                sample_list = list(set(sample_list))
+
+                tracks_to_predict = {
+                    'track_index': [track_infos['object_id'].index(id) for id in sample_list if
+                                    id in track_infos['object_id']],
+                    'object_type': [track_infos['object_type'][track_infos['object_id'].index(id)] for id in sample_list if
+                                    id in track_infos['object_id']],
+                }
+
+            ret['tracks_to_predict'] = tracks_to_predict
+            ret['map_center'] = scenario['metadata'].get('map_center', np.zeros(3))[np.newaxis]
+            ret['scene_token'] = scene_token            
+
+            ret_list.append(ret)
 
         return ret_list
+    
+
+    def process(self, preprocess_output): #MJTODO: center_objects가 뭔지 // internal_format은 preprocess의 결과물이 넘어온다.
+        ret_list_list = []
+        for internal_format in preprocess_output:
+            info = internal_format
+            scene_id = info['scenario_id']
+            scene_token = info['scene_token']
+            #MODIFY
+            start_index = info["start_index"]
+
+            sdc_track_index = info['sdc_track_index'] #ego의 track_index를 sdc_track_index로 저장 -> info["track_infos"]["object_id"][sdc_track_index]를 하면 ego가 나올거임
+            current_time_index = info['current_time_index'] #현재 time은 위에서 구하는 방식에 의해서 구해지고 그걸 current_time_index로 저장
+            timestamps = np.array(info['timestamps_seconds'][:current_time_index + 1], dtype=np.float32) #current_time_index를 이용해서 timestamp를 지정한 길이만크 current_time까지 시간대를 저장 -> 예시 curr = 20(index라서 2.1초), 길이 = (21) , [0, 0.1,..., 2.0]
+            #MODIFY
+            timestamps_token = np.array(info['timestamp_token']).reshape(1, len(info['timestamp_token']))
+            past_timestamp_token = np.array(info['timestamp_token'][:current_time_index + 1]).reshape(1, len(info['timestamp_token'][:current_time_index + 1]))
+            future_timestamp_token = np.array(info["timestamp_token"][current_time_index +1 :]).reshape(1, len(info['timestamp_token'][current_time_index + 1:]))
+            curr_timestamp_token = np.array(info["timestamp_token"][current_time_index])
+            
+            track_infos = info['track_infos'] #track_infos안에는 object_id, object_type, trajs로 구성되어 있음
+
+            track_index_to_predict = np.array(info['tracks_to_predict']['track_index']) #tacks_to_predict의 track_index를 track_index_to_predict로 저장
+            obj_types = np.array(track_infos['object_type']) #object_type을 저장, 이건 tracks_to_predict만이 아니라 scene안의 모든 객체(num_objects)의 type 
+            obj_trajs_full = track_infos['trajs']  # (num_objects, num_timestamp, 10) -> 여기의 num_timestamp는 timestamps랑은 다름 전자는 81초 즉, 모든 시간대의 정보, 후자는 내가 봐여할 길이만큼 처리된 길이
+            obj_trajs_past = obj_trajs_full[:, :current_time_index + 1] #그래서 여기서 current_time_index를 가지고 과거의 정보를 가지고 옴 -> 21초
+            obj_trajs_future = obj_trajs_full[:, current_time_index + 1:] #위와 마찬가지로 current_time_index를 가지고 미래의 정보를 가지고 옴 -> 60초
+
+            center_objects, track_index_to_predict = self.get_interested_agents( #MJTODO: 여기서 center_objects를 만드는 부분
+                track_index_to_predict=track_index_to_predict,
+                obj_trajs_full=obj_trajs_full,
+                current_time_index=current_time_index,
+                obj_types=obj_types, scene_id=scene_id
+            ) #get_interested_agents 함수를 거쳐서 나온 결과물은 center_objects에 대한 current_timestamp에 대한 trajs정보와 center_objects의 track_index를 가지고온다.
+            if center_objects is None: return None
+
+            sample_num = center_objects.shape[0] #일단 처음은 하나
+
+            (obj_trajs_data, obj_trajs_mask, obj_trajs_pos, obj_trajs_last_pos, obj_trajs_future_state,
+            obj_trajs_future_mask, center_gt_trajs,
+            center_gt_trajs_mask, center_gt_final_valid_idx,
+            track_index_to_predict_new) = self.get_agent_data( #get_agent_data 
+                center_objects=center_objects, obj_trajs_past=obj_trajs_past, obj_trajs_future=obj_trajs_future,
+                track_index_to_predict=track_index_to_predict, sdc_track_index=sdc_track_index,
+                timestamps=timestamps, obj_types=obj_types
+            )
+
+            ret_dict = { #MJTODO: ret_list의 구성
+                'scenario_id': np.array([scene_id] * len(track_index_to_predict)),
+                'start_index': np.array(start_index),
+                'current_time_index' : np.array([current_time_index]),
+                #MODIFY
+                'scene_token': np.array([scene_token] * len(track_index_to_predict)),
+                'obj_trajs': obj_trajs_data,
+                'obj_trajs_mask': obj_trajs_mask,
+                'track_index_to_predict': track_index_to_predict_new,  # used to select center-features
+                'obj_trajs_pos': obj_trajs_pos,
+                'obj_trajs_last_pos': obj_trajs_last_pos,
+                #MODIFY
+                'timestamp_ns': timestamps_token,
+                'past_timestamp_ns': past_timestamp_token,
+                'future_timestamp_ns': future_timestamp_token,
+                'curr_timestamp_ns': [curr_timestamp_token],
+
+                'center_objects_world': center_objects,
+                'center_objects_id': np.array(track_infos['object_id'])[track_index_to_predict],
+                'center_objects_type': np.array(track_infos['object_type'])[track_index_to_predict],
+                'map_center': info['map_center'],
+
+                'obj_trajs_future_state': obj_trajs_future_state,
+                'obj_trajs_future_mask': obj_trajs_future_mask,
+                'center_gt_trajs': center_gt_trajs,
+                'center_gt_trajs_mask': center_gt_trajs_mask,
+                'center_gt_final_valid_idx': center_gt_final_valid_idx,
+                'center_gt_trajs_src': obj_trajs_full[track_index_to_predict]
+                
+            }
+
+            if info['map_infos']['all_polylines'].__len__() == 0:
+                info['map_infos']['all_polylines'] = np.zeros((2, 7), dtype=np.float32)
+                print(f'Warning: empty HDMap {scene_id}')
+
+            if self.config.manually_split_lane:
+                map_polylines_data, map_polylines_mask, map_polylines_center = self.get_manually_split_map_data(
+                    center_objects=center_objects, map_infos=info['map_infos'])
+            else:
+                map_polylines_data, map_polylines_mask, map_polylines_center = self.get_map_data(
+                    center_objects=center_objects, map_infos=info['map_infos'])
+
+            ret_dict['map_polylines'] = map_polylines_data
+            ret_dict['map_polylines_mask'] = map_polylines_mask.astype(bool)
+            ret_dict['map_polylines_center'] = map_polylines_center
+
+        # masking out unused attributes to Zero
+            masked_attributes = self.config['masked_attributes']
+            if 'z_axis' in masked_attributes:
+                ret_dict['obj_trajs'][..., 2] = 0
+                ret_dict['map_polylines'][..., 2] = 0
+            if 'size' in masked_attributes:
+                ret_dict['obj_trajs'][..., 3:6] = 0
+            if 'velocity' in masked_attributes:
+                ret_dict['obj_trajs'][..., 25:27] = 0
+            if 'acceleration' in masked_attributes:
+                ret_dict['obj_trajs'][..., 27:29] = 0
+            if 'heading' in masked_attributes:
+                ret_dict['obj_trajs'][..., 23:25] = 0
+
+        # change every thing to float32
+            for k, v in ret_dict.items():
+                if isinstance(v, np.ndarray) and v.dtype == np.float64:
+                    ret_dict[k] = v.astype(np.float32)
+
+            ret_dict['map_center'] = ret_dict['map_center'].repeat(sample_num, axis=0)
+            ret_dict['dataset_name'] = [info['dataset']] * sample_num
+
+            ret_list = []
+            for i in range(sample_num):
+                ret_dict_i = {}
+                for k, v in ret_dict.items():
+                    ret_dict_i[k] = v[i]
+                ret_list.append(ret_dict_i)
+            
+            ret_list_list.append(ret_list)
+
+        return ret_list_list #그러면 여기도 15개 
 
     def postprocess(self, output):
 
@@ -488,7 +521,7 @@ class BaseDataset(Dataset):
             with open(self.data_loaded_keys[idx], 'rb') as f:
                 return pickle.load(f)
 
-    def get_data_list(self, data_usage): #MJTODO get_data_list
+    def get_data_list(self, data_usage): 
         file_list_path = os.path.join(self.cache_path, 'file_list.pkl') #cache_autobot folder안에 있는 pkl을 불러오기 위한 pkl경로를 저장해논 pkl을 받아옴
         if os.path.exists(file_list_path):
             data_loaded = pickle.load(open(file_list_path, 'rb')) #pkl경로를 가지고 있는 pkl을 data_loaded로 받아옴 -> dict
@@ -505,11 +538,11 @@ class BaseDataset(Dataset):
             data_loaded = dict(data_list)
         return data_loaded
 
-    def get_agent_data( #MJTODO: sdc_track_index를 어떻게 처리하는지(->최종적으로 ego-vehicle 정보를 뱉는게 맞는지)
+    def get_agent_data( 
             self, center_objects, obj_trajs_past, obj_trajs_future, track_index_to_predict, sdc_track_index, timestamps,
             obj_types
     ):
-
+        skip = self.config["skip"]
         num_center_objects = center_objects.shape[0] # 1
         num_objects, num_timestamps, box_dim = obj_trajs_past.shape #(num_objects =69, num_timestamps=21, info=10)
         obj_trajs = self.transform_trajs_to_center_coords( #transform_trajs_to_center_coords 함수로 들어감
@@ -525,7 +558,7 @@ class BaseDataset(Dataset):
         object_onehot_mask[:, obj_types == 3, :, 2] = 1
         object_onehot_mask[np.arange(num_center_objects), track_index_to_predict, :, 3] = 1
         object_onehot_mask[:, sdc_track_index, :, 4] = 1
-           #object_time_embedding의 shape은 (1,78,21,22)
+           #object_time_embedding의 shape은 (1,78,21,22) 이것도 onehot임
         object_time_embedding = np.zeros((num_center_objects, num_objects, num_timestamps, num_timestamps + 1))
         for i in range(num_timestamps):
             object_time_embedding[:, :, i, i] = 1
@@ -537,7 +570,7 @@ class BaseDataset(Dataset):
         #vel.shape = (1,78,21,2)
         vel = obj_trajs[:, :, :, 7:9] #속도값을 담는다.
         vel_pre = np.roll(vel, shift=1, axis=2) #roll은 값을 굴리는거 그래서 한칸씩 뒤로 밀려서 index에 내가 다음 위치의 값을 저장받음
-        acce = (vel - vel_pre) / 0.1 #가속도 구해주기
+        acce = (vel - vel_pre) / skip #가속도 구해주기
         acce[:, :, 0, :] = acce[:, :, 1, :] #roll 했을때, 이상한 값(마지막 시간대의 속도값)이 와버리니까 이를 방지하기 위해서
 
         obj_trajs_data = np.concatenate([
@@ -549,6 +582,8 @@ class BaseDataset(Dataset):
             acce, #2 <- 속도를 가지고 가속도를 구해서 담은 값
         ], axis=-1) #해서 총 (1,num_objects,num_timestamps,39)의 정보를 만듬 각각은 위로 구성이 되어있음
 
+
+#INFO: 39개의 모든 정보를 그냥 다 0값으로 바꿔버림
         obj_trajs_mask = obj_trajs[:, :, :, -1] #valid값을 들고와서 obj_trajs_mask값으로 사용한다.
         obj_trajs_data[obj_trajs_mask == 0] = 0 #valid하지 않은 값을 masking 해버림
 
@@ -571,6 +606,7 @@ class BaseDataset(Dataset):
         assert obj_trajs_past.__len__() == obj_trajs_data.shape[1]
         valid_past_mask = np.logical_not(obj_trajs_past[:, :, -1].sum(axis=-1) == 0) #(num_objects) -> 단 한개라도 valid하면 살리고 단 하나라도 유효하지 않은 객체라면 버리기 위해서 이 과정을 거침
 
+#INFO: 하나라도 valid하면 살리고, 아니라면 다 쳐내버림
         obj_trajs_mask = obj_trajs_mask[:, valid_past_mask] # (1,78,21)-> (1,52,21) 보정되서 줄어버린 갯수만큼 
         obj_trajs_data = obj_trajs_data[:, valid_past_mask] #(1,78,21,39) ->(1,52,21,39)
         obj_trajs_future_state = obj_trajs_future_state[:, valid_past_mask] #(1,78,60,4) -> (1,52,60,4)
@@ -579,6 +615,8 @@ class BaseDataset(Dataset):
         obj_trajs_pos = obj_trajs_data[:, :, :, 0:3] #처음 3개의 값이 x,y,z값이니까 
         num_center_objects, num_objects, num_timestamps, _ = obj_trajs_pos.shape #(1,52,21,3)
         obj_trajs_last_pos = np.zeros((num_center_objects, num_objects, 3), dtype=np.float32) # (1,52,3)
+        #MJTODO: 모든 timestamp에서 유효한 충신만 담는 코드!
+        
         for k in range(num_timestamps): #timestamp만큼 반복하면서 mask를 처리해서 값을 바꿔줌
             cur_valid_mask = obj_trajs_mask[:, :, k] > 0
             obj_trajs_last_pos[cur_valid_mask] = obj_trajs_pos[:, :, k, :][cur_valid_mask]
@@ -625,11 +663,13 @@ class BaseDataset(Dataset):
     def get_interested_agents(self, track_index_to_predict, obj_trajs_full, current_time_index, obj_types, scene_id): #MJTODO: center_objects를 만든느데 쓰이는 함수
         center_objects_list = []
         track_index_to_predict_selected = []
-        selected_type = self.config['object_type'] #config에서 object_type을 받아옴 -> VEHICLE
+        
+        selected_type = self.config['object_type'] #config에서 object_type을 받아옴 -> VEHICLE, PEDESTRIAN
         selected_type = [object_type[x] for x in selected_type] #mapping -> 1
         for k in range(len(track_index_to_predict)): 
             obj_idx = track_index_to_predict[k] #track_index_to_predict안에 저장해놨던 track_index를 가지고 온다.
 
+#INFO:current_time때 ego, tracks_to_predict의 객체가 유효한지 확인하는 과정
             if obj_trajs_full[obj_idx, current_time_index, -1] == 0: #끝값이 0인지 아닌지 보는거 0이면 말이 안되는 거니까 (10개의 정보중에 마지막 정보가 valid라서)  #MJTODO: 민상몬에게 valid를 어떤 근거로 만드는건지 질문합시다
                 print(f'Warning: obj_idx={obj_idx} is not valid at time step {current_time_index}, scene_id={scene_id}')
                 continue
