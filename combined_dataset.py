@@ -25,6 +25,7 @@ class CombinedDataset(Dataset):
         self.train_dict_path = train_dict_path
         self.val_dict_path = val_dict_path
         self.fps = self.config.TRAJ_DATASET.fps
+        self.skip = self.config.TRAJ_DATASET.skip
         
         
     def __len__(self):
@@ -64,7 +65,7 @@ class CombinedDataset(Dataset):
         scene_token = traj[0]["scene_token"]
         start_index = traj[0]["start_index"]
         current_time_index = traj[0]["current_time_index"]
-        traj_curr_index = start_index + current_time_index * self.fps
+        traj_curr_index = start_index + current_time_index * int(self.fps / self.skip)
         return scene_token, traj_curr_index
     
     
